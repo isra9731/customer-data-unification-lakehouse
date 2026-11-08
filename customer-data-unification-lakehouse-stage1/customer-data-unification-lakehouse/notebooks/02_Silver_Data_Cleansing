@@ -109,7 +109,6 @@ def safe_timestamp(column_name):
         f"try_cast(`{column_name}` AS TIMESTAMP)"
     )
 
-
 # Start with the raw Bronze customer DataFrame. All transformations are applied to a new DataFrame, leaving the original Bronze table unchanged.
 silver_customers_df = bronze_customers_df
 silver_customers_df = silver_customers_df.withColumn( # Standardise the customer ID by trimming whitespace and converting it to uppercase.
@@ -269,19 +268,16 @@ silver_customers_df = silver_customers_df.withColumn(
     "_quality_issues",
     F.concat_ws(
         "; ",
-
         # Customer ID is mandatory.
         F.when(
             F.col("customer_id").isNull(),
             F.lit("MISSING_CUSTOMER_ID")
         ),
-
         # Full name is mandatory.
         F.when(
             F.col("full_name").isNull(),
             F.lit("MISSING_CUSTOMER_NAME")
         ),
-
         # Validate email format when an email is provided.
         F.when(
             F.col("email").isNotNull()
@@ -339,37 +335,31 @@ silver_transactions_df = silver_transactions_df.withColumn(
     "_quality_issues",
     F.concat_ws(
         "; ",
-
         # Transaction ID is mandatory.
         F.when(
             F.col("transaction_id").isNull(),
             F.lit("MISSING_TRANSACTION_ID")
         ),
-
         # Customer ID is mandatory.
         F.when(
             F.col("customer_id").isNull(),
             F.lit("MISSING_CUSTOMER_ID")
         ),
-
         # Transaction date is mandatory.
         F.when(
             F.col("transaction_date").isNull(),
             F.lit("INVALID_OR_MISSING_TRANSACTION_DATE")
         ),
-
         # Amount must be available and convertible to decimal.
         F.when(
             F.col("amount").isNull(),
             F.lit("INVALID_OR_MISSING_AMOUNT")
         ),
-
         # Currency is mandatory.
         F.when(
             F.col("currency").isNull(),
             F.lit("MISSING_CURRENCY")
         ),
-
         # Channel is mandatory.
         F.when(
             F.col("channel").isNull(),
@@ -405,19 +395,16 @@ silver_contacts_df = silver_contacts_df.withColumn(
     "_quality_issues",
     F.concat_ws(
         "; ",
-
         # Contact ID is mandatory.
         F.when(
             F.col("contact_id").isNull(),
             F.lit("MISSING_CONTACT_ID")
         ),
-
         # Contact name is mandatory for identity matching.
         F.when(
             F.col("full_name").isNull(),
             F.lit("MISSING_CONTACT_NAME")
         ),
-
         # Validate email format when an email is supplied.
         F.when(
             F.col("email").isNotNull()
@@ -426,7 +413,6 @@ silver_contacts_df = silver_contacts_df.withColumn(
             ),
             F.lit("INVALID_CONTACT_EMAIL")
         ),
-
         # Source system is required to track contact provenance.
         F.when(
             F.col("source_system").isNull(),
@@ -646,3 +632,276 @@ display_quality_summary(
     silver_contacts_df,
     "Contacts"
 )
+
+# Preserve the original date of birth so invalid dates can be identified later.
+customers_df = customers_df.withColumn(
+    "_raw_date_of_birth",
+    F.col("date_of_birth")
+)
+# Preserve the original transaction date and amount before conversion.
+transactions_df = transactions_df \
+    .withColumn("_raw_transaction_date", F.col("transaction_date")) \
+    .withColumn("_raw_amount", F.col("amount"))
+
+# Identify missing and invalid customer date-of-birth values.
+silver_customers_df = silver_customers_df.withColumn(
+    "_quality_issues",
+    F.concat_ws(
+        ",",
+        F.when(
+            F.col("_raw_date_of_birth").isNotNull()
+            & F.col("date_of_birth").isNull(),
+            F.lit("INVALID_DATE_OF_BIRTH")
+        ),
+        F.when(
+            F.col("date_of_birth").isNull()
+            & F.col("_raw_date_of_birth").isNull(),
+            F.lit("MISSING_DATE_OF_BIRTH")
+        ),
+        F.col("_quality_issues")
+    )
+)
+# Identify missing or invalid transaction dates and amounts.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "_quality_issues",
+    F.concat_ws(
+        ",",
+        F.when(
+            F.col("_raw_transaction_date").isNotNull()
+            & F.col("transaction_date").isNull(),
+            F.lit("INVALID_TRANSACTION_DATE")
+        ),
+        F.when(
+            F.col("_raw_amount").isNotNull()
+            & F.col("amount").isNull(),
+            F.lit("INVALID_AMOUNT")
+        ),
+        F.col("_quality_issues")
+    )
+)
+
+# Separate records with valid customer IDs from records without IDs.
+valid_key_customers = silver_customers_df.filter(
+    F.col("customer_id").isNotNull()
+)
+
+missing_key_customers = silver_customers_df.filter(
+    F.col("customer_id").isNull()
+)
+
+# Rank customer records by latest update and ingestion timestamp.
+customer_window = Window.partitionBy("customer_id").orderBy(
+    F.col("updated_at").desc_nulls_last(),
+    F.col("_ingested_at").desc_nulls_last(),
+    F.col("_source_file").asc_nulls_last()
+)
+
+# Keep the latest record for each customer ID.
+deduplicated_customers = (
+    valid_key_customers
+    .withColumn("_row_num", F.row_number().over(customer_window))
+    .filter(F.col("_row_num") == 1)
+    .drop("_row_num")
+)
+
+# Retain all records with missing customer IDs for quality handling.
+silver_customers_df = deduplicated_customers.unionByName(
+    missing_key_customers
+)
+
+# Extract invalid customer records for investigation.
+rejected_customers_df = silver_customers_df.filter(
+    F.col("_quality_issues") != ""
+)
+
+# Extract valid customer records for downstream processing.
+silver_customers_df = silver_customers_df.filter(
+    F.col("_quality_issues") == ""
+)
+
+# Store rejected customer records in the Silver quarantine table.
+rejected_customers_df.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("customer360.silver.rejected_records")
+
+# Add a source identifier to rejected customer records.
+rejected_customers_df = (
+    silver_customers_df
+    .filter(F.col("_quality_issues") != "")
+    .withColumn("source_entity", F.lit("customers"))
+)
+
+# Add a source identifier to rejected transaction records.
+rejected_transactions_df = (
+    silver_transactions_df
+    .filter(F.col("_quality_issues") != "")
+    .withColumn("source_entity", F.lit("transactions"))
+)
+
+# Add a source identifier to rejected contact records.
+rejected_contacts_df = (
+    silver_contacts_df
+    .filter(F.col("_quality_issues") != "")
+    .withColumn("source_entity", F.lit("contacts"))
+)
+
+# Combine rejected records into one quarantine dataset.
+rejected_records_df = (
+    rejected_customers_df
+    .unionByName(rejected_transactions_df, allowMissingColumns=True)
+    .unionByName(rejected_contacts_df, allowMissingColumns=True)
+    .withColumn("rejected_at", F.current_timestamp())
+    .withColumn("rejection_run_id", F.lit(RUN_ID))
+)
+
+# Save the combined quarantine dataset as a Delta table.
+rejected_records_df.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("customer360.silver.rejected_records")
+
+# Display rejected records for inspection.
+display(rejected_records_df)
+
+# Select distinct customer IDs from the cleaned customer dataset.
+valid_customer_ids_df = (
+    silver_customers_df
+    .filter(F.col("customer_id").isNotNull())
+    .select("customer_id")
+    .distinct()
+)
+
+# Identify transactions whose customer ID does not exist.
+orphan_transactions_df = (
+    silver_transactions_df
+    .filter(F.col("customer_id").isNotNull())
+    .join(
+        valid_customer_ids_df,
+        on="customer_id",
+        how="left_anti"
+    )
+    .withColumn("_quality_issues", F.lit("UNKNOWN_CUSTOMER_ID"))
+    .withColumn("source_entity", F.lit("transactions"))
+    .withColumn("rejected_at", F.current_timestamp())
+    .withColumn("rejection_run_id", F.lit(RUN_ID))
+)
+
+# Display transactions that reference unknown customers.
+display(orphan_transactions_df)
+
+# Combine standard quality rejections with referential integrity rejections.
+final_rejected_records_df = (
+    rejected_records_df
+    .unionByName(orphan_transactions_df, allowMissingColumns=True)
+)
+
+# Save the complete quarantine dataset.
+final_rejected_records_df.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable("customer360.silver.rejected_records")
+
+# Remove rejected transactions from the trusted Silver transaction dataset.
+silver_transactions_df = (
+    silver_transactions_df
+    .join(
+        orphan_transactions_df.select("transaction_id").distinct(),
+        on="transaction_id",
+        how="left_anti"
+    )
+)
+
+# Calculate source, trusted and rejected record counts for reconciliation.
+reconciliation_data = [
+    (
+        "customers",
+        bronze_customers_df.count(),
+        silver_customers_df.count(),
+        rejected_customers_df.count()
+    ),
+    (
+        "transactions",
+        bronze_transactions_df.count(),
+        silver_transactions_df.count(),
+        rejected_transactions_df.count() + orphan_transactions_df.count()
+    ),
+    (
+        "contacts",
+        bronze_contacts_df.count(),
+        silver_contacts_df.count(),
+        rejected_contacts_df.count()
+    )
+]
+
+# Define the reconciliation output schema.
+reconciliation_schema = [
+    "source_entity",
+    "bronze_count",
+    "silver_count",
+    "rejected_count"
+]
+
+# Create the reconciliation DataFrame.
+reconciliation_df = spark.createDataFrame(
+    reconciliation_data,
+    reconciliation_schema
+)
+
+# Calculate the total accounted-for records.
+reconciliation_df = reconciliation_df.withColumn(
+    "accounted_count",
+    F.col("silver_count") + F.col("rejected_count")
+).withColumn(
+    "count_difference",
+    F.col("bronze_count") - F.col("accounted_count")
+).withColumn(
+    "reconciliation_status",
+    F.when(F.col("count_difference") == 0, "PASS")
+     .otherwise("CHECK")
+)
+
+# Display reconciliation results.
+display(reconciliation_df)
+
+# Verify that the required Silver and quarantine tables exist.
+required_tables = [
+    "customer360.silver.customers",
+    "customer360.silver.transactions",
+    "customer360.silver.contacts",
+    "customer360.silver.rejected_records"
+]
+
+# Check table availability.
+for table_name in required_tables:
+    exists = spark.catalog.tableExists(table_name)
+    print(f"{table_name}: {'EXISTS' if exists else 'MISSING'}")
+
+# Verify that trusted Silver records contain no null primary keys.
+print(
+    "Customers with null IDs:",
+    spark.table("customer360.silver.customers")
+         .filter(F.col("customer_id").isNull())
+         .count()
+)
+
+print(
+    "Transactions with null IDs:",
+    spark.table("customer360.silver.transactions")
+         .filter(F.col("transaction_id").isNull())
+         .count()
+)
+
+print(
+    "Contacts with null IDs:",
+    spark.table("customer360.silver.contacts")
+         .filter(F.col("contact_id").isNull())
+         .count()
+)
+
+# Display the final reconciliation.
+display(reconciliation_df)
+
