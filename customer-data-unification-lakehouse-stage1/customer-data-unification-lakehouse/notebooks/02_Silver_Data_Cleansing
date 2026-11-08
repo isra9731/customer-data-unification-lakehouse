@@ -1,0 +1,648 @@
+# 02 - Silver Layer: Data Cleansing and Standardisation
+Transform raw Bronze data into standardised and structured datasets that are suitable for downstream processing.
+
+## Source tables
+- bronze.customers
+- bronze.transactions
+- bronze.contacts
+
+## Transformations
+- Standardise column values.
+- Trim unnecessary whitespace.
+- Normalise names, emails and phone numbers.
+- Convert dates, timestamps and numeric values.
+- Identify missing and malformed fields.
+- Remove duplicate business records deterministically.
+- Add data quality indicators.
+
+## Output tables
+- silver.customers
+- silver.transactions
+- silver.contacts
+
+## Design principle
+Invalid records are retained with explicit quality indicators. They will be separated into quarantine tables in the next data quality notebook.
+
+from pyspark.sql import functions as F # Import PySpark functions for standardisation,validation, conditional logic and column transformations.
+from pyspark.sql import types as T # Import Spark data types for defining structured columns.
+from pyspark.sql.window import Window # Import Window functions for deterministic deduplication.
+from datetime import datetime, timezone # Import datetime utilities for execution metadata.
+import uuid # Import UUID to generate a unique execution ID.
+
+# Generate a unique identifier for this notebook execution.
+RUN_ID = str(uuid.uuid4())
+# Define the project database and Silver schema.
+DATABASE_NAME = "customer360"
+SILVER_SCHEMA = f"{DATABASE_NAME}.silver"
+
+# Define the Bronze source table names.
+BRONZE_CUSTOMERS = "customer360.bronze.customers"
+BRONZE_TRANSACTIONS = "customer360.bronze.transactions"
+BRONZE_CONTACTS = "customer360.bronze.contacts"
+
+# Define the Silver destination table names.
+SILVER_CUSTOMERS = f"{SILVER_SCHEMA}.customers"
+SILVER_TRANSACTIONS = f"{SILVER_SCHEMA}.transactions"
+SILVER_CONTACTS = f"{SILVER_SCHEMA}.contacts"
+
+# Print the execution details for traceability.
+print("Silver cleansing notebook initialised.")
+print("Run ID:", RUN_ID)
+print("Execution timestamp:", datetime.now(timezone.utc))
+
+bronze_customers_df = spark.table(BRONZE_CUSTOMERS) # Read the raw customer records from the Bronze Delta table. These records contain the original source values and ingestion metadata.
+bronze_transactions_df = spark.table(BRONZE_TRANSACTIONS) # Read the raw transaction records from the Bronze Delta table.
+bronze_contacts_df = spark.table(BRONZE_CONTACTS) # Read the raw contact records from the Bronze Delta table.
+
+# Print source record counts to establish the input baseline.
+print("Bronze customer records:", bronze_customers_df.count())
+print("Bronze transaction records:", bronze_transactions_df.count())
+print("Bronze contact records:", bronze_contacts_df.count())
+
+# Display sample records to inspect the source data before transformations.
+display(bronze_customers_df.limit(10))
+display(bronze_transactions_df.limit(10))
+display(bronze_contacts_df.limit(10))
+
+# Define a function to remove leading/trailing spaces and convert empty strings into NULL values.
+def clean_text(column_name):
+    return F.when(
+        F.trim(F.col(column_name)) == "",
+        F.lit(None)
+    ).otherwise(
+        F.trim(F.col(column_name))
+    )
+
+# Define a function to standardise person names. # It removes unnecessary whitespace and applies title casing.
+def standardise_name(column_name):
+    return F.initcap(
+        F.regexp_replace(
+            F.trim(F.col(column_name)),
+            r"\s+",
+            " "
+        )
+    )
+
+# Define a function to standardise email addresses. Emails are trimmed and converted to lowercase.
+def standardise_email(column_name):
+    return F.lower(
+        F.trim(F.col(column_name))
+    )
+
+# Define a function to standardise phone numbers. It removes spaces, brackets, hyphens and other non-numeric characters while preserving a leading plus sign.
+def standardise_phone(column_name):
+    return F.regexp_replace(
+        F.trim(F.col(column_name)),
+        r"[^0-9+]",
+        ""
+    )
+
+# Define a reusable function to convert date strings safely. Invalid date values become NULL instead of stopping processing.
+def safe_date(column_name):
+    return F.expr(
+        f"try_cast(`{column_name}` AS DATE)"
+    )
+
+# Define a reusable function to convert timestamp strings safely. Invalid timestamp values become NULL instead of causing failures.
+def safe_timestamp(column_name):
+    return F.expr(
+        f"try_cast(`{column_name}` AS TIMESTAMP)"
+    )
+
+
+# Start with the raw Bronze customer DataFrame. All transformations are applied to a new DataFrame, leaving the original Bronze table unchanged.
+silver_customers_df = bronze_customers_df
+silver_customers_df = silver_customers_df.withColumn( # Standardise the customer ID by trimming whitespace and converting it to uppercase.
+    "customer_id",
+    F.upper(clean_text("customer_id"))
+)
+silver_customers_df = silver_customers_df.withColumn( # Standardise the customer's full name. Extra spaces are removed and names are converted to title case.
+    "full_name",
+    standardise_name("full_name")
+)
+silver_customers_df = silver_customers_df.withColumn( # Standardise email addresses by trimming spaces and converting all characters to lowercase.
+    "email",
+    standardise_email("email")
+)
+silver_customers_df = silver_customers_df.withColumn( # Standardise phone numbers by removing formatting characters.
+    "phone",
+    standardise_phone("phone")
+)
+silver_customers_df = silver_customers_df.withColumn( # Standardise city names into title case.
+    "city",
+    standardise_name("city")
+)
+silver_customers_df = silver_customers_df.withColumn( # Standardise state names into uppercase.
+    "state",
+    F.upper(clean_text("state"))
+)
+silver_customers_df = silver_customers_df.withColumn( # Convert date_of_birth from a string into a DATE data type. Invalid date strings will become NULL.
+    "date_of_birth",
+    safe_date("date_of_birth")
+)
+# Convert created_at into a TIMESTAMP data type. This enables proper timestamp-based filtering and comparisons.
+silver_customers_df = silver_customers_df.withColumn(
+    "created_at",
+    safe_timestamp("created_at")
+)
+# Convert updated_at into a TIMESTAMP data type. This field will later help us identify the latest customer version.
+silver_customers_df = silver_customers_df.withColumn(
+    "updated_at",
+    safe_timestamp("updated_at")
+)
+# Add a processing timestamp to identify when the record passed through the Silver transformation.
+silver_customers_df = silver_customers_df.withColumn(
+    "_silver_processed_at",
+    F.current_timestamp()
+)
+# Add the current Silver notebook execution ID.
+silver_customers_df = silver_customers_df.withColumn(
+    "_silver_run_id",
+    F.lit(RUN_ID)
+)
+# Display the standardised customer records.
+display(silver_customers_df.limit(20))
+# Display the resulting data types to verify conversions.
+silver_customers_df.printSchema()
+
+# Start with the raw Bronze transaction DataFrame.
+silver_transactions_df = bronze_transactions_df
+
+# Standardise the transaction ID by trimming whitespace and converting it to uppercase.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "transaction_id",
+    F.upper(clean_text("transaction_id"))
+)
+# Standardise the customer ID to match the customer dimension format.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "customer_id",
+    F.upper(clean_text("customer_id"))
+)
+# Convert transaction_date into a DATE data type. Invalid date values will become NULL.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "transaction_date",
+    safe_date("transaction_date")
+)
+# Convert amount into a DECIMAL data type. Decimal is preferred over floating-point for financial values.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "amount",
+    F.expr("try_cast(amount AS DECIMAL(18,2))")
+)
+# Standardise currency codes to uppercase.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "currency",
+    F.upper(clean_text("currency"))
+)
+# Standardise transaction channel names into title case.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "channel",
+    standardise_name("channel")
+)
+# Add the Silver processing timestamp.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "_silver_processed_at",
+    F.current_timestamp()
+)
+# Add the current notebook execution ID.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "_silver_run_id",
+    F.lit(RUN_ID)
+)
+# Display standardised transaction records.
+display(silver_transactions_df.limit(20))
+# Verify that transaction dates and amounts have the expected data types.
+silver_transactions_df.printSchema()
+
+# Start with the raw Bronze contact DataFrame.
+silver_contacts_df = bronze_contacts_df
+
+# Standardise contact IDs by trimming spaces and converting them to uppercase.
+silver_contacts_df = silver_contacts_df.withColumn(
+    "contact_id",
+    F.upper(clean_text("contact_id"))
+)
+
+# Standardise contact names using the reusable name function.
+silver_contacts_df = silver_contacts_df.withColumn(
+    "full_name",
+    standardise_name("full_name")
+)
+
+# Standardise contact email addresses.
+silver_contacts_df = silver_contacts_df.withColumn(
+    "email",
+    standardise_email("email")
+)
+
+# Standardise contact phone numbers.
+silver_contacts_df = silver_contacts_df.withColumn(
+    "phone",
+    standardise_phone("phone")
+)
+
+# Standardise the source system identifier. Uppercase values make system names consistent.
+silver_contacts_df = silver_contacts_df.withColumn(
+    "source_system",
+    F.upper(clean_text("source_system"))
+)
+
+# Add the Silver processing timestamp.
+silver_contacts_df = silver_contacts_df.withColumn(
+    "_silver_processed_at",
+    F.current_timestamp()
+)
+
+# Add the current notebook execution ID.
+silver_contacts_df = silver_contacts_df.withColumn(
+    "_silver_run_id",
+    F.lit(RUN_ID)
+)
+
+# Display standardised contact records.
+display(silver_contacts_df.limit(20))
+
+# Verify the resulting schema.
+silver_contacts_df.printSchema()
+
+# Build a single quality issue column for customer records. concat_ws combines all detected issues into a readable string.
+silver_customers_df = silver_customers_df.withColumn(
+    "_quality_issues",
+    F.concat_ws(
+        "; ",
+
+        # Customer ID is mandatory.
+        F.when(
+            F.col("customer_id").isNull(),
+            F.lit("MISSING_CUSTOMER_ID")
+        ),
+
+        # Full name is mandatory.
+        F.when(
+            F.col("full_name").isNull(),
+            F.lit("MISSING_CUSTOMER_NAME")
+        ),
+
+        # Validate email format when an email is provided.
+        F.when(
+            F.col("email").isNotNull()
+            & ~F.col("email").rlike(
+                r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+            ),
+            F.lit("INVALID_EMAIL")
+        ),
+
+        # Identify DOB values that were supplied but could not be converted into a valid date.
+        F.when(
+            F.col("date_of_birth").isNull()
+            & F.col("date_of_birth").isNull(),
+            F.lit(None)
+        )
+    )
+)
+
+# Add a separate flag to identify future birth dates.
+silver_customers_df = silver_customers_df.withColumn(
+    "_quality_issues",
+    F.concat_ws(
+        "; ",
+        F.col("_quality_issues"),
+        F.when(
+            F.col("date_of_birth") > F.current_date(),
+            F.lit("FUTURE_DATE_OF_BIRTH")
+        )
+    )
+)
+
+# Mark records with no detected issues as valid. Records with one or more issues are marked invalid.
+silver_customers_df = silver_customers_df.withColumn(
+    "_is_valid",
+    F.when(
+        F.length(F.col("_quality_issues")) == 0,
+        F.lit(True)
+    ).otherwise(F.lit(False))
+)
+
+# Display customer records with their quality indicators.
+display(
+    silver_customers_df.select(
+        "customer_id",
+        "full_name",
+        "email",
+        "date_of_birth",
+        "_quality_issues",
+        "_is_valid"
+    )
+)
+
+# Add a quality issue column for transaction records.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "_quality_issues",
+    F.concat_ws(
+        "; ",
+
+        # Transaction ID is mandatory.
+        F.when(
+            F.col("transaction_id").isNull(),
+            F.lit("MISSING_TRANSACTION_ID")
+        ),
+
+        # Customer ID is mandatory.
+        F.when(
+            F.col("customer_id").isNull(),
+            F.lit("MISSING_CUSTOMER_ID")
+        ),
+
+        # Transaction date is mandatory.
+        F.when(
+            F.col("transaction_date").isNull(),
+            F.lit("INVALID_OR_MISSING_TRANSACTION_DATE")
+        ),
+
+        # Amount must be available and convertible to decimal.
+        F.when(
+            F.col("amount").isNull(),
+            F.lit("INVALID_OR_MISSING_AMOUNT")
+        ),
+
+        # Currency is mandatory.
+        F.when(
+            F.col("currency").isNull(),
+            F.lit("MISSING_CURRENCY")
+        ),
+
+        # Channel is mandatory.
+        F.when(
+            F.col("channel").isNull(),
+            F.lit("MISSING_CHANNEL")
+        )
+    )
+)
+
+# Mark a transaction as valid only when no quality issues exist.
+silver_transactions_df = silver_transactions_df.withColumn(
+    "_is_valid",
+    F.when(
+        F.length(F.col("_quality_issues")) == 0,
+        F.lit(True)
+    ).otherwise(F.lit(False))
+)
+
+# Display transaction records with their quality indicators.
+display(
+    silver_transactions_df.select(
+        "transaction_id",
+        "customer_id",
+        "transaction_date",
+        "amount",
+        "currency",
+        "_quality_issues",
+        "_is_valid"
+    )
+)
+
+# Add a quality issue column for contact records.
+silver_contacts_df = silver_contacts_df.withColumn(
+    "_quality_issues",
+    F.concat_ws(
+        "; ",
+
+        # Contact ID is mandatory.
+        F.when(
+            F.col("contact_id").isNull(),
+            F.lit("MISSING_CONTACT_ID")
+        ),
+
+        # Contact name is mandatory for identity matching.
+        F.when(
+            F.col("full_name").isNull(),
+            F.lit("MISSING_CONTACT_NAME")
+        ),
+
+        # Validate email format when an email is supplied.
+        F.when(
+            F.col("email").isNotNull()
+            & ~F.col("email").rlike(
+                r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
+            ),
+            F.lit("INVALID_CONTACT_EMAIL")
+        ),
+
+        # Source system is required to track contact provenance.
+        F.when(
+            F.col("source_system").isNull(),
+            F.lit("MISSING_SOURCE_SYSTEM")
+        )
+    )
+)
+
+# Mark contacts as valid when no quality issues are detected.
+silver_contacts_df = silver_contacts_df.withColumn(
+    "_is_valid",
+    F.when(
+        F.length(F.col("_quality_issues")) == 0,
+        F.lit(True)
+    ).otherwise(F.lit(False))
+)
+
+# Display contact records with their quality indicators.
+display(
+    silver_contacts_df.select(
+        "contact_id",
+        "full_name",
+        "email",
+        "phone",
+        "source_system",
+        "_quality_issues",
+        "_is_valid"
+    )
+)
+
+# Define a window partitioned by customer ID. Records for the same customer are ranked together.
+customer_window = (
+    Window
+    .partitionBy("customer_id")
+    .orderBy(
+        F.col("updated_at").desc_nulls_last(),
+        F.col("_ingested_at").desc_nulls_last()
+    )
+)
+
+# Assign a row number to each customer record. The latest record receives rank 1.
+customers_ranked_df = silver_customers_df.withColumn(
+    "_duplicate_rank",
+    F.row_number().over(customer_window)
+)
+
+# Count how many duplicate records will be removed. This is calculated before filtering the ranked DataFrame.
+customer_duplicate_count = (
+    customers_ranked_df
+    .filter(F.col("_duplicate_rank") > 1)
+    .count()
+)
+
+# Retain only the latest record for each customer ID. Remove the temporary ranking column afterwards.
+silver_customers_df = (
+    customers_ranked_df
+    .filter(F.col("_duplicate_rank") == 1)
+    .drop("_duplicate_rank")
+)
+
+# Display the number of duplicate customer records identified.
+print("Duplicate customer records removed:", customer_duplicate_count)
+
+# Define a window partitioned by transaction ID. The most recently ingested version is retained.
+transaction_window = (
+    Window
+    .partitionBy("transaction_id")
+    .orderBy(
+        F.col("_ingested_at").desc_nulls_last()
+    )
+)
+
+# Rank transaction records within each transaction ID.
+transactions_ranked_df = silver_transactions_df.withColumn(
+    "_duplicate_rank",
+    F.row_number().over(transaction_window)
+)
+
+# Count duplicate transaction records before removing them.
+transaction_duplicate_count = (
+    transactions_ranked_df
+    .filter(F.col("_duplicate_rank") > 1)
+    .count()
+)
+
+# Retain the latest record for each transaction ID.
+silver_transactions_df = (
+    transactions_ranked_df
+    .filter(F.col("_duplicate_rank") == 1)
+    .drop("_duplicate_rank")
+)
+
+# Display the duplicate transaction count.
+print("Duplicate transaction records removed:", transaction_duplicate_count)
+
+# Define a window partitioned by contact ID. The most recently ingested contact record is retained.
+contact_window = (
+    Window
+    .partitionBy("contact_id")
+    .orderBy(
+        F.col("_ingested_at").desc_nulls_last()
+    )
+)
+
+# Rank all contact records within their respective contact IDs.
+contacts_ranked_df = silver_contacts_df.withColumn(
+    "_duplicate_rank",
+    F.row_number().over(contact_window)
+)
+
+# Count duplicate contact records before filtering.
+contact_duplicate_count = (
+    contacts_ranked_df
+    .filter(F.col("_duplicate_rank") > 1)
+    .count()
+)
+
+# Keep only the latest contact record for each contact ID.
+silver_contacts_df = (
+    contacts_ranked_df
+    .filter(F.col("_duplicate_rank") == 1)
+    .drop("_duplicate_rank")
+)
+
+# Display the number of duplicate contact records removed.
+print("Duplicate contact records removed:", contact_duplicate_count)
+
+# Ensure that the Silver schema exists before writing tables. This allows the notebook to be executed independently after the Bronze layer has been created.
+spark.sql(
+    "CREATE SCHEMA IF NOT EXISTS customer360.silver"
+)
+# Verify that the Silver schema is available.
+spark.sql("SHOW SCHEMAS").show(truncate=False)
+
+# Save the standardised customer DataFrame as a Delta table. Overwrite is used here because this notebook currently rebuilds Silver from the available Bronze snapshot.
+silver_customers_df.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(SILVER_CUSTOMERS)
+
+# Save the standardised transaction DataFrame as a Delta table.
+silver_transactions_df.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(SILVER_TRANSACTIONS)
+
+# Save the standardised contact DataFrame as a Delta table.
+silver_contacts_df.write \
+    .format("delta") \
+    .mode("overwrite") \
+    .option("overwriteSchema", "true") \
+    .saveAsTable(SILVER_CONTACTS)
+
+# Confirm that all three Silver tables were written successfully.
+print("Silver customer, transaction and contact tables created.")
+
+# Read the newly created Silver customer table and calculate its final record count.
+customer_count = spark.table(SILVER_CUSTOMERS).count()
+
+# Read the newly created Silver transaction table and calculate its final record count.
+transaction_count = spark.table(SILVER_TRANSACTIONS).count()
+
+# Read the newly created Silver contact table and calculate its final record count.
+contact_count = spark.table(SILVER_CONTACTS).count()
+
+# Build a summary of the final Silver table counts.
+silver_summary = [
+    ("customers", customer_count),
+    ("transactions", transaction_count),
+    ("contacts", contact_count)
+]
+
+# Convert the summary into a Spark DataFrame.
+silver_summary_df = spark.createDataFrame(
+    silver_summary,
+    ["dataset", "silver_record_count"]
+)
+
+# Display the final Silver record counts.
+display(silver_summary_df)
+
+# Display the customer schema to verify data type conversions.
+spark.table(SILVER_CUSTOMERS).printSchema()
+
+# Define a reusable function to calculate valid and invalid record counts for any Silver DataFrame.
+def display_quality_summary(dataframe, dataset_name):
+    # Count records marked as valid.
+    valid_count = dataframe.filter(
+        F.col("_is_valid") == True
+    ).count()
+    # Count records marked as invalid.
+    invalid_count = dataframe.filter(
+        F.col("_is_valid") == False
+    ).count()
+    # Print the quality summary for the dataset.
+    print(f"\nDataset: {dataset_name}")
+    print(f"Valid records: {valid_count}")
+    print(f"Invalid records: {invalid_count}")
+    print(f"Total records: {valid_count + invalid_count}")
+
+# Calculate the customer quality summary.
+display_quality_summary(
+    silver_customers_df,
+    "Customers"
+)
+
+# Calculate the transaction quality summary.
+display_quality_summary(
+    silver_transactions_df,
+    "Transactions"
+)
+
+# Calculate the contact quality summary.
+display_quality_summary(
+    silver_contacts_df,
+    "Contacts"
+)
